@@ -69,7 +69,7 @@ with st.form(key="forecast_form"):
   
 # Function to call the FastAPI endpoint with retry logic
 def call_forecast_api(date, branch, move_type):
-    url = "https://testing-move-count.onrender.com/forecast/"
+    url = "https://move-forecast-api-mjjq.onrender.com/forecast/"
     payload = {
         "date": date.strftime("%Y-%m-%d"),
         "branch": branch,
