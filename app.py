@@ -3,47 +3,16 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime
-import psycopg2
-from dateutil.parser import parse
 
 # Streamlit app configuration
 st.set_page_config(page_title="Move Forecast App", page_icon="📈", layout="centered")
-
-# Local PostgreSQL configuration
-DB_CONFIG = {
-    'dbname': 'forecast_db',
-    'user': 'postgres',
-    'password': 'Satya@6372',
-    'host': 'localhost',
-    'port': '5432'
-}
-
-# Save forecast query to local PostgreSQL
-def save_query_to_db(input_date, branch, move_type, forecasted_count):
-    conn = None
-    cursor = None
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO forecast_queries (input_date, branch, move_type, forecasted_count)
-            VALUES (%s, %s, %s, %s)
-        """, (input_date, branch, move_type, forecasted_count))
-        conn.commit()
-    except Exception as e:
-        st.error(f"Error saving query to local PostgreSQL: {str(e)}")
-        raise
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
 
 # Title and description
 st.title("Move Forecast Application")
 st.markdown("Enter a date, branch, and optional move type to forecast move counts using our API.")
 
 # Hardcoded unique values
+
 branch_options = [
     "", "Albuquerque", "Atlanta", "Atlanta 3", "Atlanta South", "Austin", "Austin South", "Baton Rouge",
     "Birmingham", "Boise", "Boston", "Boulder", "Boynton Beach", "Charleston", "Charlotte", "Charlotte South",
@@ -81,7 +50,6 @@ with st.form(key="forecast_form"):
         value=min_date,
         help=f"Choose a date between today ({current_date.strftime('%Y-%m-%d')}) and July 31, 2025."
     )
-
     # Branch dropdown
     branch = st.selectbox(
         "Select Branch",
@@ -89,7 +57,6 @@ with st.form(key="forecast_form"):
         index=0,
         help="Choose a branch location."
     )
-
     # Move Type dropdown
     move_type = st.selectbox(
         "Select Move Type (Optional)",
@@ -97,13 +64,12 @@ with st.form(key="forecast_form"):
         index=0,
         help="Choose a move type or leave empty."
     )
-
     # Forecast button
     submit_button = st.form_submit_button(label="Get Forecast")
-
+  
 # Function to call the FastAPI endpoint with retry logic
 def call_forecast_api(date, branch, move_type):
-    url = "https://move-forecast-api.onrender.com/forecast/"
+    url = "https://testing-move-count.onrender.com/forecast/"
     payload = {
         "date": date.strftime("%Y-%m-%d"),
         "branch": branch,
@@ -119,15 +85,16 @@ def call_forecast_api(date, branch, move_type):
     except requests.exceptions.HTTPError as e:
         try:
             error_detail = e.response.json().get("detail", e.response.text)
-        except ValueError:  # Catch JSONDecodeError
+        except ValueError: # Catch JSONDecodeError
             error_detail = e.response.text
+        # Display the raw error response content
         st.error(f"API Error (Status {e.response.status_code}):")
         st.code(error_detail, language='text')
         return None
     except requests.exceptions.RequestException as e:
         st.error(f"Network Error: Unable to connect to the API. {str(e)}")
         return None
-
+      
 # Handle form submission
 if submit_button:
     if not branch:
@@ -136,14 +103,5 @@ if submit_button:
         with st.spinner("Fetching forecast..."):
             result = call_forecast_api(date, branch, move_type)
             if result:
-                try:
-                    # Save each forecast to local PostgreSQL
-                    for forecast in result['predicted_summary']:
-                        input_date = parse(forecast['date']).date()
-                        forecasted_count = forecast['predicted_moves']
-                        save_query_to_db(input_date, result['branch'], result['move_type'], forecasted_count)
-                    
-                    # Show the raw JSON response for success
-                    st.json(result)
-                except Exception as e:
-                    st.error(f"Error saving forecast to local PostgreSQL: {str(e)}")
+                # Only show the raw JSON response for success
+                st.json(result)
