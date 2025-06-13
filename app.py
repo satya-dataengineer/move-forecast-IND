@@ -69,7 +69,7 @@ with st.form(key="forecast_form"):
   
 # Function to call the FastAPI endpoint with retry logic
 def call_forecast_api(date, branch, move_type):
-    url = "https://move-forecast-api-mjjq.onrender.com/forecast/"
+    url = "http://20.81.241.192:8002/forecast/"
     payload = {
         "date": date.strftime("%Y-%m-%d"),
         "branch": branch,
@@ -77,7 +77,7 @@ def call_forecast_api(date, branch, move_type):
     }
     session = requests.Session()
     retries = Retry(total=5, backoff_factor=2, status_forcelist=[502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.mount("http://", HTTPAdapter(max_retries=retries))
     try:
         response = session.post(url, json=payload, timeout=200)
         response.raise_for_status()
