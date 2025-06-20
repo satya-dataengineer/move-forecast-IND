@@ -5,6 +5,7 @@ import os
 import pickle
 import warnings
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
@@ -14,6 +15,8 @@ from psycopg2.extras import RealDictCursor
 import numpy as np
 import random
 import glob
+import nest_asyncio
+nest_asyncio.apply()
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +33,15 @@ warnings.filterwarnings('ignore')  # Suppress Prophet logging
 
 # Initialize FastAPI app
 app = FastAPI(title="Move Forecast API", description="API to forecast move counts using Prophet models")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # PostgreSQL connection configuration
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -69,7 +81,7 @@ init_db()
 def fetch_historical_percentages(branch, move_type, month, day):
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(**DB_CONFIG)
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             # Try day-specific percentage
             cursor.execute("""
@@ -106,8 +118,8 @@ def fetch_historical_percentages(branch, move_type, month, day):
 
 # Define input model for request validation
 class ForecastInput(BaseModel):
-    date: str  # e.g., "2025-06-11"
-    branch: str  # e.g., "Columbus"
+    date: str  # e.g., "2025-06-30"
+    branch: str  # e.g., "Bangalore"
     move_type: Optional[str] = None  # e.g., "Local"
 
 # Comment phrases
@@ -174,11 +186,11 @@ def forecast_move(input_date, input_branch, input_move_type=None, model_dir='pro
         try:
             input_date_dt = pd.to_datetime(input_date, format='%Y-%m-%d')
         except ValueError:
-            raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., '2025-06-11')")
+            raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., '2025-06-30')")
         
         # Validate input date
-        if input_date_dt > pd.to_datetime('2025-12-31'):
-            raise ValueError("Date must be on or before December 31, 2025")
+        if input_date_dt > pd.to_datetime('2025-07-31'):
+            raise ValueError("Date must be on or before July 31, 2025")
         
         # Step 2: Validate branch
         if input_branch not in model_cache:
@@ -195,20 +207,22 @@ def forecast_move(input_date, input_branch, input_move_type=None, model_dir='pro
         # Step 4: Load Prophet model
         model = model_cache[input_branch]
         
-        # Step 5: Generate forecast for the 15-day window
+        # Step 5: Generate forecast for the 7-day window
         today = pd.to_datetime(datetime.now().date())
+        max_date = pd.to_datetime('2025-07-31')
         days_from_today = (input_date_dt - today).days
+        days_to_max = (max_date - input_date_dt).days
 
-        if days_from_today <= 7:
+        if days_from_today <= 3:  # Start from today if within 3 days
             start_date = today
-            end_date = today + timedelta(days=14)
-        else:
-            start_date = input_date_dt - timedelta(days=7)
-            end_date = input_date_dt + timedelta(days=7)
+            end_date = min(today + timedelta(days=6), max_date)
+        elif days_to_max <= 3:  # End at max date if within 3 days of July 31
+            end_date = max_date
+            start_date = max(end_date - timedelta(days=6), today)
+        else:  # Center the window around the input date
+            start_date = max(input_date_dt - timedelta(days=3), today)
+            end_date = min(input_date_dt + timedelta(days=3), max_date)
 
-        if end_date > pd.to_datetime('2025-12-31'):
-            end_date = pd.to_datetime('2025-12-31')
-        
         future_dates = pd.date_range(start=start_date, end=end_date, freq='D')
         future_df = pd.DataFrame({'ds': future_dates})
         forecast = model.predict(future_df)
@@ -319,6 +333,75 @@ def forecast_move(input_date, input_branch, input_move_type=None, model_dir='pro
         logger.error(f"Forecast error: {str(e)}")
         raise ValueError(str(e))
 
+def fetch_historical_trends(input_date, input_branch, input_move_type=None):
+    try:
+        # Convert input date
+        input_date_dt = pd.to_datetime(input_date, format='%Y-%m-%d')
+        
+        # Define 7-day window
+        today = pd.to_datetime(datetime.now().date())
+        max_date = pd.to_datetime('2025-07-31')
+        days_from_today = (input_date_dt - today).days
+        days_to_max = (max_date - input_date_dt).days
+
+        if days_from_today <= 3:
+            start_date = today
+            end_date = min(today + timedelta(days=6), max_date)
+        elif days_to_max <= 3:
+            end_date = max_date
+            start_date = max(end_date - timedelta(days=6), today)
+        else:
+            start_date = max(input_date_dt - timedelta(days=3), today)
+            end_date = min(input_date_dt + timedelta(days=3), max_date)
+        
+        # Fetch historical data for the same window in previous years
+        historical_data = []
+        years = range(2019, 2025)  # Historical data from 2019 to 2024
+        for year in years:
+            window_start = start_date.replace(year=year)
+            window_end = end_date.replace(year=year)
+            if input_move_type:
+                query = """
+                    SELECT "Date", SUM("Count") as total_moves
+                    FROM historical_data
+                    WHERE "Branch" = %s AND "MoveType" = %s AND "Date" BETWEEN %s AND %s
+                    GROUP BY "Date"
+                    ORDER BY "Date"
+                """
+                params = (input_branch, input_move_type, window_start, window_end)
+            else:
+                query = """
+                    SELECT "Date", SUM("Count") as total_moves
+                    FROM historical_data
+                    WHERE "Branch" = %s AND "Date" BETWEEN %s AND %s
+                    GROUP BY "Date"
+                    ORDER BY "Date"
+                """
+                params = (input_branch, window_start, window_end)
+            
+            df = fetch_data(query, params=params)
+            historical_data.append({
+                "year": year,
+                "data": [
+                    {"date": row['Date'].strftime('%m-%d'), "moves": row['total_moves']}
+                    for _, row in df.iterrows()
+                ]
+            })
+        
+        return {
+            "branch": input_branch,
+            "move_type": input_move_type,
+            "historical_trends": historical_data,
+            "window": {
+                "start_date": start_date.strftime('%Y-%m-%d'),
+                "end_date": end_date.strftime('%Y-%m-%d')
+            }
+        }
+    
+    except Exception as e:
+        logger.error(f"Error fetching historical trends: {str(e)}")
+        raise ValueError(str(e))
+
 # API endpoints
 @app.get("/", response_model=dict)
 @app.head("/")
@@ -328,8 +411,25 @@ async def root():
 @app.post("/forecast/")
 async def forecast_endpoint(input_data: ForecastInput):
     try:
-        logger.info(f"Received request: {input_data.dict()}")
+        logger.info(f"Received forecast request: {input_data.dict()}")
         result = forecast_move(
+            input_date=input_data.date,
+            input_branch=input_data.branch,
+            input_move_type=input_data.move_type
+        )
+        return result
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+@app.post("/historical_trends/")
+async def historical_trends_endpoint(input_data: ForecastInput):
+    try:
+        logger.info(f"Received historical trends request: {input_data.dict()}")
+        result = fetch_historical_trends(
             input_date=input_data.date,
             input_branch=input_data.branch,
             input_move_type=input_data.move_type
