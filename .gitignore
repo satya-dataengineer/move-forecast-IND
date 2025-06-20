@@ -1,0 +1,62 @@
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.bak
+
+# FastAPI/Testing
+*.log
+*.cache
+.coverage
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.pytest_cache/
+
+# Data science/ML
+*.ipynb_checkpoints/
+*.h5
+*.hdf5
+*.model
+
+# IDE/Editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*.tmp
+
+# Documentation
+docs/_build/
