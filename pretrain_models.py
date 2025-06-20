@@ -4,14 +4,8 @@ from prophet import Prophet
 import os
 import pickle
  
-DB_CONFIG ={  
-    'dbname': 'forecast_db',
-    'user': 'postgres',
-    'password': 'Satya@6372',
-    'host': 'localhost',
-    'port': '5432'
-}    
-conn = psycopg2.connect(**DB_CONFIG)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+conn = psycopg2.connect(DATABASE_URL)
 df_agg = pd.read_sql_query('SELECT "Date", "Branch", "Count" FROM forecasting_data', conn)
 conn.close()
  
@@ -23,12 +17,12 @@ unique_branches = df_agg['Branch'].unique()
  
 for branch in unique_branches:
     branch_data = df_agg[df_agg['Branch'] == branch][['Date', 'Count']].rename(columns={'Date': 'ds', 'Count': 'y'})
-    train_data = branch_data[branch_data['ds'] <= '2025-06-17']
+    train_data = branch_data[branch_data['ds'] <= '2023-12-31']
     if len(train_data) >= 2:
         model = Prophet(
             daily_seasonality=True,
             yearly_seasonality=True,
-            weekly_seasonality=True,  # Disabled to reduce computation
+            weekly_seasonality=False,  # Disabled to reduce computation
             changepoint_prior_scale=0.01,
             seasonality_prior_scale=15.0,
             seasonality_mode='multiplicative'
