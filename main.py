@@ -1,227 +1,346 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
-from pydantic import BaseModel
 import pandas as pd
 from prophet import Prophet
-import pickle
 from datetime import datetime, timedelta
-import pytz
-from typing import List, Dict
 import os
-import logging
+import pickle
+import warnings
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
 import uvicorn
+import logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import numpy as np
+import random
+import glob
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('api.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+warnings.filterwarnings('ignore')  # Suppress Prophet logging
 
-# MCP API Key
-MCP_API_KEY = "YmFzZTY0c3RyaW5nZm9ybWNwYXV0aGVudGljYXRpb24"
+# Initialize FastAPI app
+app = FastAPI(title="Move Forecast API", description="API to forecast move counts using Prophet models")
 
-# Dependency to validate MCP API key
-def verify_api_key(x_api_key: str = Header(...)):
-    if x_api_key != MCP_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return x_api_key
+# PostgreSQL connection configuration
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
 
-# Paths to datasets and models (relative to main.py)
-DATA_PATH = r"C:\Users\sswain_quantum-i\OneDrive\Desktop"
-MODEL_PATH = os.path.join(DATA_PATH, "Prophet_Models")
-
-# Load datasets
-try:
-    forecasting_data = pd.read_csv(os.path.join(DATA_PATH, "Forecasting_Data.csv"))
-    final_data = pd.read_csv(os.path.join(DATA_PATH, "Final_Data.csv"))
-except FileNotFoundError as e:
-    logger.error(f"Dataset not found: {e}")
-    raise HTTPException(status_code=500, detail=f"Dataset not found: {e}")
-
-# Convert date columns to datetime
-try:
-    forecasting_data['Date'] = pd.to_datetime(forecasting_data['Date'], format="%Y-%m-%d")
-    final_data['Date'] = pd.to_datetime(final_data['Date'], format="%Y-%m-%d")
-except Exception as e:
-    logger.error(f"Error parsing dates: {e}")
-    raise HTTPException(status_code=500, detail=f"Error parsing dates: {e}")
-
-# Pydantic models for request/response
-class ForecastRequest(BaseModel):
-    date: str  # Expected format: DD-MM-YYYY
-    branch: str
-    move_type: str
-
-class ForecastResponse(BaseModel):
-    dates: List[str]
-    counts: List[float]
-    move_size_counts: Dict[str, float]
-    crew_trucks: Dict[str, Dict[str, int]]
-    hourly_rates: Dict[str, float]
-    historical_counts: Dict[str, float]
-
-# Helper function to load branch-specific Prophet model
-def load_prophet_model(branch: str) -> Prophet:
-    model_file = os.path.join(MODEL_PATH, f"prophet_model_{branch}.pkl")
-    if not os.path.exists(model_file):
-        logger.error(f"No model found for branch: {branch}")
-        raise HTTPException(status_code=400, detail=f"No model found for branch: {branch}")
+# Function to fetch data from PostgreSQL
+def fetch_data(query, params=None):
     try:
-        with open(model_file, "rb") as f:
-            return pickle.load(f)
+        conn = psycopg2.connect(DATABASE_URL)
+        df = pd.read_sql_query(query, conn, params=params)
+        return df
     except Exception as e:
-        logger.error(f"Error loading model for branch {branch}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error loading model for branch {branch}: {e}")
+        logger.error(f"Error fetching data from PostgreSQL: {str(e)}")
+        raise
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
-# Helper function to get 7-day window
-def get_forecast_window(input_date: datetime) -> tuple[datetime, datetime]:
-    current_date = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
-    last_forecast_date = datetime(2025, 7, 31)
-    
-    if (input_date - current_date).days < 3:
-        start_date = current_date
-        end_date = start_date + timedelta(days=6)
-    elif (last_forecast_date - input_date).days < 3:
-        end_date = last_forecast_date
-        start_date = end_date - timedelta(days=6)
-    else:
-        start_date = input_date - timedelta(days=3)
-        end_date = input_date + timedelta(days=3)
-    return start_date, end_date
-
-# Calculate move type and move size percentages for last 4 years
-def calculate_percentages(branch: str, move_type: str, input_date: datetime) -> tuple[Dict[str, float], float]:
-    start_year = input_date.year - 4
-    end_year = input_date.year - 1
-    historical = final_data[(final_data['Date'].dt.year.between(start_year, end_year)) & 
-                           (final_data['Branch'] == branch)]
-    
-    # Move type percentages
-    total_counts = historical.groupby('MoveType')['Count'].sum()
-    move_type_percentages = (total_counts / total_counts.sum() * 100).to_dict()
-    move_type_pct = move_type_percentages.get(move_type, 0.0) / 100 if total_counts.sum() > 0 else 0.0
-    
-    # Move size percentages for the given move type
-    move_type_data = historical[historical['MoveType'] == move_type]
-    move_size_counts = move_type_data.groupby('MoveSize')['Count'].sum()
-    move_size_percentages = (move_size_counts / move_size_counts.sum() * 100).to_dict() if move_size_counts.sum() > 0 else {ms: 0.0 for ms in final_data['MoveSize'].unique()}
-    move_size_percentages = {ms: move_size_percentages.get(ms, 0.0) / 100 for ms in final_data['MoveSize'].unique()}
-    
-    return move_size_percentages, move_type_pct
-
-# Forecast endpoint
-@app.post("/forecast", response_model=ForecastResponse, dependencies=[Depends(verify_api_key)])
-async def forecast(request: ForecastRequest):
+# Function to initialize PostgreSQL (verify connection)
+def init_db():
+    conn = None
     try:
-        # Parse input date (DD-MM-YYYY)
-        input_date = pd.to_datetime(request.date, format="%d-%m-%Y").replace(tzinfo=None)
-        branch = request.branch
-        move_type = request.move_type
+        conn = psycopg2.connect(DATABASE_URL)
+        logger.info("PostgreSQL connection verified successfully")
+    except Exception as e:
+        logger.error(f"Error initializing database: {str(e)}")
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
-        # Validate inputs
-        if branch not in forecasting_data['Branch'].unique():
-            logger.error(f"Invalid branch: {branch}")
-            raise HTTPException(status_code=400, detail="Invalid branch")
-        if move_type not in final_data['MoveType'].unique():
-            logger.error(f"Invalid move type: {move_type}")
-            raise HTTPException(status_code=400, detail="Invalid move type")
+# Initialize database
+init_db()
 
-        # Load branch-specific Prophet model
-        model = load_prophet_model(branch)
+# Function to fetch precomputed percentages
+def fetch_historical_percentages(branch, move_type, month, day):
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Try day-specific percentage
+            cursor.execute("""
+                SELECT avg_percentage
+                FROM historical_percentages
+                WHERE branch = %s AND move_type = %s AND month = %s AND day = %s
+            """, (branch, move_type, month, day))
+            result = cursor.fetchone()
+            if result:
+                logger.info(f"Found day-specific percentage: {result['avg_percentage']}% for {branch}, {move_type}, month {month}, day {day}")
+                return result['avg_percentage']
+            
+            # Fallback to monthly average
+            cursor.execute("""
+                SELECT AVG(avg_percentage) as avg_percentage
+                FROM historical_percentages
+                WHERE branch = %s AND move_type = %s AND month = %s
+            """, (branch, move_type, month))
+            result = cursor.fetchone()
+            if result and result['avg_percentage'] is not None:
+                logger.info(f"Using monthly average percentage: {result['avg_percentage']}% for {branch}, {move_type}, month {month}")
+                return result['avg_percentage']
+            
+            # Fallback to minimal percentage
+            minimal_percentage = 1.0  # 1% as a logical default
+            logger.warning(f"No percentage data for {branch}, {move_type}, month {month}. Using minimal percentage: {minimal_percentage}%")
+            return minimal_percentage
+    except Exception as e:
+        logger.error(f"Error fetching historical percentage: {str(e)}")
+        return 1.0  # Minimal percentage on error
+    finally:
+        if conn is not None:
+            conn.close()
 
-        # Get 7-day window
-        start_date, end_date = get_forecast_window(input_date)
+# Define input model for request validation
+class ForecastInput(BaseModel):
+    date: str  # e.g., "2025-06-11"
+    branch: str  # e.g., "Columbus"
+    move_type: Optional[str] = None  # e.g., "Local"
+
+# Comment phrases
+CONSISTENT_PHRASES = [
+    "Demand for {move_type} moves aligns closely with historical patterns (historical avg {hist_avg:.1f}%, current {current:.1f}%).",
+    "{move_type} move demand is in line with past trends (historical avg {hist_avg:.1f}%, current {current:.1f}%).",
+    "Expected {move_type} moves are consistent with historical data (historical avg {hist_avg:.1f}%, current {current:.1f}%)."
+]
+STRONGER_PHRASES = [
+    "Demand for {move_type} moves is higher than historical trends (historical avg {hist_avg:.1f}%, current {current:.1f}%).",
+    "{move_type} move demand exceeds past patterns (historical avg {hist_avg:.1f}%, current {current:.1f}%).",
+    "Projected {move_type} moves show stronger demand than historical norms (historical avg {hist_avg:.1f}%, current {current:.1f}%)."
+]
+WEAKER_PHRASES = [
+    "Demand for {move_type} moves is lower than historical trends (historical avg {hist_avg:.1f}%, current {current:.1f}%).",
+    "{move_type} move demand is below past trends (historical avg {hist_avg:.1f}%, current {current:.1f}%).",
+    "Expected {move_type} moves are weaker compared to historical data (historical avg {hist_avg:.1f}%, current {current:.1f}%)."
+]
+NO_MOVE_TYPE_PHRASE = "Forecast reflects total moves for the branch, with no move type specified."
+
+# Summary comment phrases
+SUMMARY_CONSISTENT_PHRASES = [
+    "This period's {move_type} move demand in {branch} aligns with historical averages ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically).",
+    "{move_type} moves in {branch} for this period are consistent with past trends ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically).",
+    "The demand for {move_type} moves in {branch} this period matches historical patterns ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically)."
+]
+SUMMARY_STRONGER_PHRASES = [
+    "This period's {move_type} move demand in {branch} is stronger than historical averages ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically).",
+    "{move_type} moves in {branch} show higher demand this period compared to past years ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically).",
+    "Demand for {move_type} moves in {branch} is elevated this period relative to historical trends ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically)."
+]
+SUMMARY_WEAKER_PHRASES = [
+    "This period's {move_type} move demand in {branch} is lower than historical averages ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically).",
+    "{move_type} moves in {branch} are below historical trends for this period ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically).",
+    "Demand for {move_type} moves in {branch} is weaker this period compared to past years ({current_year:.1f}% in 2025 vs. {hist_avg:.1f}% historically)."
+]
+SUMMARY_NO_MOVE_TYPE = "This forecast reflects total moves for {branch} over the period, with no move type specified."
+
+# In-memory model cache
+model_cache = {}
+
+# Load Prophet models at startup
+def load_models(model_dir='prophet_models'):
+    global model_cache
+    os.makedirs(model_dir, exist_ok=True)
+    for model_path in glob.glob(os.path.join(model_dir, '*.pkl')):
+        branch = os.path.splitext(os.path.basename(model_path))[0].replace("prophet_model_", "")
+        try:
+            with open(model_path, 'rb') as f:
+                model_cache[branch] = pickle.load(f)
+            logger.info(f"Loaded model for {branch}")
+        except Exception as e:
+            logger.error(f"Error loading model {model_path}: {str(e)}")
+    if not model_cache:
+        raise ValueError("No models loaded from prophet_models/")
+    logger.info(f"Loaded {len(model_cache)} Prophet models")
+
+# Load models at startup
+load_models()
+
+def forecast_move(input_date, input_branch, input_move_type=None, model_dir='prophet_models'):
+    try:
+        # Step 1: Convert input date to datetime
+        try:
+            input_date_dt = pd.to_datetime(input_date, format='%Y-%m-%d')
+        except ValueError:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., '2025-06-11')")
+        
+        # Validate input date
+        if input_date_dt > pd.to_datetime('2025-12-31'):
+            raise ValueError("Date must be on or before December 31, 2025")
+        
+        # Step 2: Validate branch
+        if input_branch not in model_cache:
+            raise ValueError(f"Branch {input_branch} not found. Valid branches: {list(model_cache.keys())}")
+        
+        # Step 3: Validate move_type if provided
+        if input_move_type is not None:
+            move_types = fetch_data('SELECT DISTINCT move_type FROM historical_percentages')
+            valid_move_types = move_types['move_type'].unique()
+            if input_move_type not in valid_move_types:
+                logger.warning(f"Invalid MoveType {input_move_type}. Using minimal percentage.")
+                input_move_type = None  # Treat as no move type to use 100%
+        
+        # Step 4: Load Prophet model
+        model = model_cache[input_branch]
+        
+        # Step 5: Generate forecast for the 15-day window
+        today = pd.to_datetime(datetime.now().date())
+        days_from_today = (input_date_dt - today).days
+
+        if days_from_today <= 7:
+            start_date = today
+            end_date = today + timedelta(days=14)
+        else:
+            start_date = input_date_dt - timedelta(days=7)
+            end_date = input_date_dt + timedelta(days=7)
+
+        if end_date > pd.to_datetime('2025-12-31'):
+            end_date = pd.to_datetime('2025-12-31')
+        
         future_dates = pd.date_range(start=start_date, end=end_date, freq='D')
         future_df = pd.DataFrame({'ds': future_dates})
-
-        # Forecast counts for branch
         forecast = model.predict(future_df)
-        forecast_counts = forecast[['ds', 'yhat']].set_index('ds')['yhat'].clip(lower=0).to_dict()
-        forecast_dates = [dt.strftime("%Y-%m-%d") for dt in future_dates]
-        forecast_values = [round(forecast_counts.get(dt, 0), 2) for dt in future_dates]
-
-        # Adjust for move type using last 4 years' average percentage
-        move_size_percentages, move_type_pct = calculate_percentages(branch, move_type, input_date)
-        input_date_count = forecast_counts.get(input_date, 0) * move_type_pct
-        move_size_counts = {ms: round(input_date_count * pct, 2) for ms, pct in move_size_percentages.items()}
-
-        # Get crew size, trucks, and hourly rates for input date
-        crew_trucks = {}
-        hourly_rates = {}
-        for ms in final_data['MoveSize'].unique():
-            ms_data = final_data[(final_data['Date'].dt.date == input_date.date()) & 
-                                (final_data['Branch'] == branch) & 
-                                (final_data['MoveType'] == move_type) & 
-                                (final_data['MoveSize'] == ms)]
-            if not ms_data.empty:
-                crew_trucks[ms] = {
-                    'CrewSize': int(ms_data['CrewSize'].iloc[0]),
-                    'Trucks': int(ms_data['Trucks'].iloc[0])
-                }
-                hourly_rates[ms] = round(float(ms_data['HourlyRate'].iloc[0]), 2)
+        
+        forecast = forecast[forecast['ds'] >= today]
+        forecast = forecast[['ds', 'yhat']].rename(columns={'ds': 'Date', 'yhat': 'Count'})
+        forecast['Count'] = forecast['Count'].clip(lower=0).round().astype(int)
+        
+        # Step 6: Calculate historical percentage
+        percentage = 100.0
+        if input_move_type is not None:
+            month = input_date_dt.month
+            day = input_date_dt.day
+            percentage = fetch_historical_percentages(input_branch, input_move_type, month, day)
+        
+        # Step 7: Prepare output
+        predicted_summary = []
+        total_predicted_moves = 0
+        total_branch_forecast = 0
+        
+        for _, row in forecast.iterrows():
+            forecast_date = row['Date']
+            branch_forecast = row['Count']
+            
+            final_forecast = (percentage / 100) * branch_forecast
+            final_forecast = int(round(final_forecast))
+            
+            total_predicted_moves += final_forecast
+            total_branch_forecast += branch_forecast
+            
+            comment = ""
+            if input_move_type is not None:
+                month = forecast_date.month
+                day = forecast_date.day
+                hist_avg = fetch_historical_percentages(input_branch, input_move_type, month, day)
+                
+                implied_percentage = (final_forecast / branch_forecast * 100) if branch_forecast > 0 else 0
+                percentage_diff = implied_percentage - hist_avg
+                
+                if abs(percentage_diff) <= 5:
+                    comment = random.choice(CONSISTENT_PHRASES).format(
+                        move_type=input_move_type, hist_avg=hist_avg, current=implied_percentage
+                    )
+                elif percentage_diff > 5:
+                    comment = random.choice(STRONGER_PHRASES).format(
+                        move_type=input_move_type, hist_avg=hist_avg, current=implied_percentage
+                    )
+                else:
+                    comment = random.choice(WEAKER_PHRASES).format(
+                        move_type=input_move_type, hist_avg=hist_avg, current=implied_percentage
+                    )
             else:
-                crew_trucks[ms] = {'CrewSize': 0, 'Trucks': 0}
-                hourly_rates[ms] = 0.0
-
-        # Get historical counts for past 3 years
-        historical_counts = {}
-        for year in range(2022, 2025):
-            past_date = input_date.replace(year=year)
-            past_data = final_data[(final_data['Date'].dt.date == past_date.date()) & 
-                                  (final_data['Branch'] == branch) & 
-                                  (final_data['MoveType'] == move_type)]
-            historical_counts[str(year)] = round(past_data['Count'].sum(), 2) if not past_data.empty else 0.0
-
-        return ForecastResponse(
-            dates=forecast_dates,
-            counts=forecast_values,
-            move_size_counts=move_size_counts,
-            crew_trucks=crew_trucks,
-            hourly_rates=hourly_rates,
-            historical_counts=historical_counts
-        )
+                comment = NO_MOVE_TYPE_PHRASE
+            
+            predicted_summary.append({
+                "date": forecast_date.strftime('%Y-%m-%d'),
+                "predicted_moves": final_forecast,
+                "comment": comment
+            })
+        
+        average_daily_moves = int(round(total_predicted_moves / len(predicted_summary))) if predicted_summary else 0
+        
+        # Step 8: Calculate summary comment
+        summary_comment = ""
+        if input_move_type is not None:
+            current_percentage = (total_predicted_moves / total_branch_forecast * 100) if total_branch_forecast > 0 else 0
+            historical_percentages = []
+            for forecast_date in pd.date_range(start=start_date, end=end_date, freq='D'):
+                if forecast_date < today:
+                    continue
+                hist_avg = fetch_historical_percentages(input_branch, input_move_type, forecast_date.month, forecast_date.day)
+                historical_percentages.append(hist_avg)
+            
+            historical_period_avg = sum(historical_percentages) / len(historical_percentages) if historical_percentages else percentage
+            period_percentage_diff = current_percentage - historical_period_avg
+            
+            if abs(period_percentage_diff) <= 5:
+                summary_comment = random.choice(SUMMARY_CONSISTENT_PHRASES).format(
+                    move_type=input_move_type, branch=input_branch, current_year=current_percentage, hist_avg=historical_period_avg
+                )
+            elif period_percentage_diff > 5:
+                summary_comment = random.choice(SUMMARY_STRONGER_PHRASES).format(
+                    move_type=input_move_type, branch=input_branch, current_year=current_percentage, hist_avg=historical_period_avg
+                )
+            else:
+                summary_comment = random.choice(SUMMARY_WEAKER_PHRASES).format(
+                    move_type=input_move_type, branch=input_branch, current_year=current_percentage, hist_avg=historical_period_avg
+                )
+        else:
+            summary_comment = SUMMARY_NO_MOVE_TYPE.format(branch=input_branch)
+        
+        result = {
+            "branch": input_branch,
+            "move_type": input_move_type,
+            "forecast_window": {
+                "start_date": start_date.strftime('%Y-%m-%d'),
+                "end_date": end_date.strftime('%Y-%m-%d')
+            },
+            "predicted_summary": predicted_summary,
+            "total_predicted_moves": total_predicted_moves,
+            "average_daily_moves": average_daily_moves,
+            "summary_comment": summary_comment
+        }
+        
+        return result
+    
     except Exception as e:
-        logger.error(f"Error in forecast endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Forecast error: {str(e)}")
+        raise ValueError(str(e))
 
-# Trend endpoint
-@app.post("/trend", response_model=Dict[str, List], dependencies=[Depends(verify_api_key)])
-async def get_trend(request: ForecastRequest):
+# API endpoints
+@app.get("/", response_model=dict)
+@app.head("/")
+async def root():
+    return {"message": "Welcome to the Move Forecast API. Visit /docs for API documentation."}
+
+@app.post("/forecast/")
+async def forecast_endpoint(input_data: ForecastInput):
     try:
-        input_date = pd.to_datetime(request.date, format="%d-%m-%Y")
-        branch = request.branch
-        move_type = request.move_type
-
-        # Validate inputs
-        if branch not in forecasting_data['Branch'].unique():
-            logger.error(f"Invalid branch: {branch}")
-            raise HTTPException(status_code=400, detail="Invalid branch")
-        if move_type not in final_data['MoveType'].unique():
-            logger.error(f"Invalid move type: {move_type}")
-            raise HTTPException(status_code=400, detail="Invalid move type")
-
-        # Load branch-specific Prophet model
-        model = load_prophet_model(branch)
-
-        # Get historical data for 2022–2024 and forecast for 2025
-        trend_data = {'years': [], 'counts': []}
-        for year in range(2022, 2026):
-            year_date = input_date.replace(year=year)
-            if year == 2025:
-                future_df = pd.DataFrame({'ds': [year_date]})
-                forecast = model.predict(future_df)
-                move_size_percentages, move_type_pct = calculate_percentages(branch, move_type, year_date)
-                count = round(forecast['yhat'].iloc[0] * move_type_pct, 2)
-            else:
-                data = final_data[(final_data['Date'].dt.date == year_date.date()) & 
-                                 (final_data['Branch'] == branch) & 
-                                 (final_data['MoveType'] == move_type)]
-                count = round(data['Count'].sum(), 2) if not data.empty else 0.0
-            trend_data['years'].append(str(year))
-            trend_data['counts'].append(count)
-        return trend_data
+        logger.info(f"Received request: {input_data.dict()}")
+        result = forecast_move(
+            input_date=input_data.date,
+            input_branch=input_data.branch,
+            input_move_type=input_data.move_type
+        )
+        return result
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in trend endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 # Run the server
 if __name__ == "__main__":
