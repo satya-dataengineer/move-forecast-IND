@@ -44,14 +44,18 @@ app.add_middleware(
 )
 
 # PostgreSQL connection configuration
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable not set")
+DB_CONFIG = {
+    'dbname': 'forecast_db',
+    'user': 'postgres',
+    'password': 'Satya@6372',
+    'host': 'localhost',
+    'port': '5432'
+}
 
 # Function to fetch data from PostgreSQL
 def fetch_data(query, params=None):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(**DB_CONFIG)
         df = pd.read_sql_query(query, conn, params=params)
         return df
     except Exception as e:
@@ -65,7 +69,7 @@ def fetch_data(query, params=None):
 def init_db():
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(**DB_CONFIG)
         logger.info("PostgreSQL connection verified successfully")
     except Exception as e:
         logger.error(f"Error initializing database: {str(e)}")
@@ -228,7 +232,7 @@ def forecast_move(input_date, input_branch, input_move_type=None, model_dir='pro
         forecast = model.predict(future_df)
         
         forecast = forecast[forecast['ds'] >= today]
-        forecast = forecast[['ds', 'yhat']].rename(columns={'ds': 'Date', 'yhat': 'Count'})
+        forecast = forecast[['ds', 'yhat_upper']].rename(columns={'ds': 'Date', 'yhat_upper': 'Count'})
         forecast['Count'] = forecast['Count'].clip(lower=0).round().astype(int)
         
         # Step 6: Calculate historical percentage
